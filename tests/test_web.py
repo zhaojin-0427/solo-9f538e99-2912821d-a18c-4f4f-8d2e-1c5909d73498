@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import sqlite3
 
 import pytest
 
@@ -344,3 +345,222 @@ class TestPersistence:
             assert core.get_edition(conn, 1) is None
         finally:
             conn.close()
+
+
+class TestPublishMergesFormWithStoredDraft:
+    """发布 = 本次表单校订 + 生成前读到的已存草稿，归档时核对基线。"""
+
+    def test_form_changes_reach_edition_and_draft_together(self, client):
+        draft_id = upload(client)
+        _, revision, html = draft_form(client, draft_id)
+        fields = occurrence_fields(html)
+        assert len(fields) == 3
+
+        # 先保存一处，再在发布表单里带上另一处与它自己的新值。
+        saved = {f"status:{fields[0]}": "keep", "text:" + str(fields[0]): "先保存"}
+        assert (
+            client.post(
+                f"/draft/{draft_id}/save", data={"revision": revision, **saved}
+            ).status_code
+            == 302
+        )
+
+        data = {"revision": revision}
+        for index in fields:
+            data[f"status:{index}"] = "keep"
+            data[f"text:{index}"] = f"发布时{index}"
+        response = client.post(f"/draft/{draft_id}/publish", data=data)
+        assert response.status_code == 302
+        assert "/editions/1" in response.headers["Location"]
+
+        body = client.get("/editions/1/download").data.decode()
+        texts = [cue.text for cue in core.parse_vtt(body)]
+        for index in fields:
+            assert f"发布时{index}" in texts
+        assert "先保存" not in texts
+
+        # 发布的校订也落到草稿里：重新打开草稿页显示的就是发布时填的字。
+        html_after = draft_form(client, draft_id)[2]
+        for index in fields:
+            assert f"发布时{index}" in html_after
+
+    def test_other_window_saving_during_generation_requires_refresh(self, client, monkeypatch):
+        draft_id = upload(client)
+        _, revision, html = draft_form(client, draft_id)
+        fields = occurrence_fields(html)
+        original_build = core.build_output
+
+        def racing_build(fragments, decisions):
+            text = original_build(fragments, decisions)
+            # 另一窗口在本页生成期间保存了校订。
+            other = client.post(
+                f"/draft/{draft_id}/save",
+                data={
+                    "revision": revision,
+                    f"status:{fields[0]}": "keep",
+                    f"text:{fields[0]}": "别处的文字",
+                },
+            )
+            assert other.status_code == 302
+            return text
+
+        monkeypatch.setattr(core, "build_output", racing_build)
+
+        data = {"revision": revision}
+        for index in fields:
+            data[f"status:{index}"] = "keep"
+            data[f"text:{index}"] = f"本页{index}"
+        response = client.post(f"/draft/{draft_id}/publish", data=data)
+        assert response.status_code == 409
+        page = response.data.decode()
+        assert "刷新" in page
+        # 失败不产生版本，也不吞掉另一窗口的保存。
+        assert client.get("/editions").data.decode().count("下载 WebVTT") == 0
+        after = draft_form(client, draft_id)[2]
+        assert "别处的文字" in after
+        assert "本页" not in after
+
+    def test_new_upload_during_generation_requires_refresh(self, client, monkeypatch):
+        draft_id = upload(client)
+        _, revision, html = draft_form(client, draft_id)
+        fields = occurrence_fields(html)
+        original_build = core.build_output
+
+        def racing_build(fragments, decisions):
+            text = original_build(fragments, decisions)
+            upload(client, csv=CSV.replace("00:00:12.000", "00:00:11.000"))
+            return text
+
+        monkeypatch.setattr(core, "build_output", racing_build)
+        data = {"revision": revision}
+        for index in fields:
+            data[f"status:{index}"] = "keep"
+            data[f"text:{index}"] = "不应入档"
+        response = client.post(f"/draft/{draft_id}/publish", data=data)
+        assert response.status_code == 409
+        assert "刷新" in response.data.decode()
+        assert client.get("/editions").data.decode().count("下载 WebVTT") == 0
+        assert "不应入档" not in draft_form(client, draft_id)[2]
+
+    def test_publish_during_generation_requires_refresh(self, client, monkeypatch):
+        draft_id = upload(client)
+        _, revision, html = draft_form(client, draft_id)
+        fields = occurrence_fields(html)
+        original_build = core.build_output
+        state = {"fired": False}
+
+        def racing_build(fragments, decisions):
+            text = original_build(fragments, decisions)
+            if not state["fired"]:
+                state["fired"] = True
+                other = client.post(
+                    f"/draft/{draft_id}/publish",
+                    data={
+                        "revision": revision,
+                        **{
+                            f"status:{index}": "delete"
+                            for index in fields
+                        },
+                    },
+                )
+                assert other.status_code == 302
+            return text
+
+        monkeypatch.setattr(core, "build_output", racing_build)
+        data = {"revision": revision}
+        for index in fields:
+            data[f"status:{index}"] = "keep"
+            data[f"text:{index}"] = f"本次{index}"
+        response = client.post(f"/draft/{draft_id}/publish", data=data)
+        assert response.status_code == 409
+        assert "刷新" in response.data.decode()
+        # 只产生先归档的那一版。
+        versions = re.findall(r"/editions/(\d+)", client.get("/editions").data.decode())
+        assert set(versions) == {"1"}
+
+    def test_pending_keeps_valid_changes_and_marks_remaining_cuts(self, client):
+        draft_id = upload(client)
+        _, revision, html = draft_form(client, draft_id)
+        fields = occurrence_fields(html)
+        # 只填第一处：发布被挡下，但这次合法校订要保留。
+        data = {
+            "revision": revision,
+            f"status:{fields[0]}": "keep",
+            f"text:{fields[0]}": "已处理的一处",
+        }
+        response = client.post(f"/draft/{draft_id}/publish", data=data)
+        assert response.status_code == 422
+        page = response.data.decode()
+        assert "未处理" in page
+        assert "已处理的一处" in page  # 页面保留本次填写
+        assert page.count("待处理") >= len(fields)  # 剩余剪口被标出
+
+        after = draft_form(client, draft_id)[2]
+        assert "已处理的一处" in after
+        assert client.get("/editions").data.decode().count("下载 WebVTT") == 0
+
+    def test_invalid_form_is_rejected_and_entries_preserved(self, client):
+        draft_id = upload(client)
+        _, revision, html = draft_form(client, draft_id)
+        fields = occurrence_fields(html)
+        data = {"revision": revision}
+        for index in fields:
+            data[f"status:{index}"] = "keep"
+            data[f"text:{index}"] = f"暂存{index}"
+        # 破坏其中一处状态值：整张表单作废，已填文字仍要回显。
+        data[f"status:{fields[1]}"] = "maybe"
+        response = client.post(f"/draft/{draft_id}/publish", data=data)
+        assert response.status_code == 422
+        page = response.data.decode()
+        assert "请选择保留文字或标为删除" in page
+        for index in fields:
+            assert f"暂存{index}" in page
+        after = draft_form(client, draft_id)[2]
+        assert "暂存" not in after  # 草稿没有写入本次改动
+        assert client.get("/editions").data.decode().count("下载 WebVTT") == 0
+
+    def test_archive_write_failure_reports_and_preserves_form(self, client, tmp_path):
+        draft_id = upload(client)
+        _, revision, html = draft_form(client, draft_id)
+        fields = occurrence_fields(html)
+        data = {"revision": revision}
+        for index in fields:
+            data[f"status:{index}"] = "keep"
+            data[f"text:{index}"] = f"归档失败{index}"
+
+        original_diff = core._write_decision_diff
+
+        def failing_diff(conn, draft_id_, base, merged):
+            # 先写入一部分，再模拟磁盘错误：整体必须回滚。
+            original_diff(conn, draft_id_, base, merged)
+            raise sqlite3.OperationalError("disk I/O error")
+
+        core._write_decision_diff = failing_diff
+        try:
+            response = client.post(f"/draft/{draft_id}/publish", data=data)
+        finally:
+            core._write_decision_diff = original_diff
+
+        assert response.status_code == 500
+        page = response.data.decode()
+        assert "归档未完成" in page
+        for index in fields:
+            assert f"归档失败{index}" in page
+        assert client.get("/editions").data.decode().count("下载 WebVTT") == 0
+        conn = core.connect(str(tmp_path / "test.db"))
+        try:
+            assert core.get_edition(conn, 1) is None
+            assert core.decision_rows(conn, draft_id) == {}
+        finally:
+            conn.close()
+
+    def test_validation_error_explains_reason(self, client):
+        draft_id = upload(client)
+        _, revision, html = draft_form(client, draft_id)
+        fields = occurrence_fields(html)
+        response = client.post(
+            f"/draft/{draft_id}/publish",
+            data={"revision": revision, f"status:{fields[0]}": "maybe"},
+        )
+        assert response.status_code == 422
+        assert "请选择保留文字或标为删除" in response.data.decode()

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import io
 import os
+import sqlite3
 from pathlib import Path
 
 from flask import (
@@ -26,9 +27,8 @@ DEFAULT_DB = os.path.join(os.path.dirname(os.path.dirname(__file__)), "data", "o
 def create_app(database_path: str | None = None) -> Flask:
     app = Flask(__name__)
     app.config.update(
-        DATABASE=os.environ.get("ORAL_HISTORY_DB")
-        or database_path
-        or DEFAULT_DB,
+        # 显式路径优先（测试/嵌入），否则用环境变量，最后落到本地默认值。
+        DATABASE=(database_path or os.environ.get("ORAL_HISTORY_DB") or DEFAULT_DB),
         MAX_CONTENT_LENGTH=32 * 1024 * 1024,
         SECRET_KEY=os.environ.get("ORAL_HISTORY_SECRET", "oral-history-local"),
         JSON_AS_ASCII=False,
@@ -138,8 +138,14 @@ def create_app(database_path: str | None = None) -> Flask:
         except core.StaleDraft:
             return _stale_response(conn, draft_id)
         except core.ValidationError as exc:
-            flash(str(exc), "error")
-            return redirect(url_for("draft_page", draft_id=draft_id))
+            return _failure_response(conn, draft_id, str(exc))
+        except sqlite3.Error:
+            return _failure_response(
+                conn,
+                draft_id,
+                "保存校订时写入数据库失败，本次改动没有保存，请稍后重试。",
+                status=500,
+            )
         flash("校订已保存。", "ok")
         return redirect(url_for("draft_page", draft_id=draft_id))
 
@@ -154,23 +160,31 @@ def create_app(database_path: str | None = None) -> Flask:
         revision = _form_revision()
         changes = _collect_changes(bundle, request.form)
         try:
-            # 页面上的编辑与发布一次提交：先按同一版本号保存，再发布。
-            if changes:
-                core.save_decisions(conn, draft_id, revision, changes)
-            version_no = core.publish(conn, draft_id, revision)
+            # 表单校订合入生成前读到的草稿，再生成 WebVTT 并原子归档。
+            version_no = core.publish_with_changes(
+                conn, draft_id, revision, changes
+            )
         except core.StaleDraft:
             return _stale_response(conn, draft_id)
         except core.ValidationError as exc:
-            flash(str(exc), "error")
-            return redirect(url_for("draft_page", draft_id=draft_id))
+            return _failure_response(conn, draft_id, str(exc))
         except core.PublishBlocked as exc:
+            # 草稿未变时本次合法校订已保留，页面标记剩余待处理剪口。
             bundle = core.load_bundle(conn, draft_id)
-            view = _draft_view(conn, bundle)
+            view = _draft_view(conn, bundle, _form_overrides(bundle, request.form))
             view["error"] = (
                 f"还有 {len(exc.pending)} 处剪口字幕未处理，处理完才能发布。"
-                "已处理的内容已保留。"
+                "本次填写的合法校订已保留，尚未发布，发布存档没有变化。"
             )
             return render_template("draft.html", **view), 422
+        except sqlite3.Error:
+            return _failure_response(
+                conn,
+                draft_id,
+                "发布时写入数据库失败（归档未完成），本次改动没有保存，"
+                "也没有产生新版本，请稍后重试。",
+                status=500,
+            )
         flash(f"已发布第 {version_no} 版。", "ok")
         return redirect(url_for("edition_detail", version_no=version_no))
 
@@ -250,17 +264,47 @@ def _collect_changes(bundle: dict, form) -> list[dict]:
     return changes
 
 
+def _form_overrides(bundle: dict, form) -> dict[int, dict]:
+    """把表单里的校订按出现序号取出，供失败页面原样回显。
+
+    校订文字按出现位置上送，不依赖签名是否仍有效。
+    """
+    overrides: dict[int, dict] = {}
+    for index, occ in enumerate(bundle["occurrences"]):
+        if occ.kind != core.CUT:
+            continue
+        status = form.get(f"status:{index}")
+        text = form.get(f"text:{index}")
+        if status is None and text is None:
+            continue
+        overrides[index] = {"status": status, "text": text or ""}
+    return overrides
+
+
+def _failure_response(conn, draft_id: int, message: str, status: int = 422):
+    """表单无效或写入失败：说明原因并保留本次填写的校订，不写入任何内容。"""
+    bundle = core.load_bundle(conn, draft_id)
+    if bundle is None:
+        abort(404)
+    view = _draft_view(conn, bundle, _form_overrides(bundle, request.form))
+    view["error"] = message
+    return render_template("draft.html", **view), status
+
+
 def _stale_response(conn, draft_id: int):
     bundle = core.load_bundle(conn, draft_id)
     if bundle is None:
         abort(404)
     view = _draft_view(conn, bundle)
     view["stale"] = True
-    view["stale_message"] = "校订页已过期：剪辑表已更换或该页已提交过，请刷新后重新录入。"
+    view["stale_message"] = (
+        "校订页已过期：剪辑表已更换、该页已发布，或校订已在其他页面保存，"
+        "请刷新后重新录入。"
+    )
     return render_template("draft.html", **view), 409
 
 
-def _draft_view(conn, bundle: dict) -> dict:
+def _draft_view(conn, bundle: dict, form_overrides: dict | None = None) -> dict:
     row = bundle["row"]
     fragments = bundle["fragments"]
     decisions = bundle["decisions"]
@@ -272,13 +316,24 @@ def _draft_view(conn, bundle: dict) -> dict:
         core.decision_rows(conn, previous["id"]) if previous is not None else {}
     )
 
+    overrides = form_overrides or {}
     cards = []
     occurrence_index = -1
     for fragment in fragments:
         frag_cards = []
         for occ in fragment.occurrences:
             occurrence_index += 1
+            override = overrides.get(occurrence_index)
             decision = decisions.get(occ.signature)
+            if occ.kind == core.CUT and override is not None:
+                # 失败提交的页面回显：文字与选择都按本次填写展示。
+                status_value = override.get("status")
+                decision = {
+                    "status": status_value
+                    if status_value in ("keep", "delete")
+                    else None,
+                    "text": override.get("text") or "",
+                }
             frag_cards.append(
                 {
                     "index": occurrence_index,

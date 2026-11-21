@@ -600,7 +600,8 @@ def load_bundle(conn: sqlite3.Connection, draft_id: int) -> Optional[dict]:
         "decisions": decision_rows(conn, draft_id),
         "lock_version": current_lock,
         "stale": row["published_version"] is not None
-        or row["revision"] != current_lock,    }
+        or row["revision"] != current_lock,
+    }
 
 
 def _reject_if_stale(
@@ -618,12 +619,81 @@ def _reject_if_stale(
     return row
 
 
+def _cut_signatures(fragments: list[Fragment]) -> set[str]:
+    return {occ.signature for occ in flatten(fragments) if occ.kind == CUT}
+
+
+def merge_decisions(
+    fragments: list[Fragment],
+    base: dict[str, dict],
+    changes: Iterable[dict],
+) -> dict[str, dict]:
+    """把表单校订合入一份基线校订，返回新的校订映射（不写数据库）。
+
+    无效的签名或状态抛 ValidationError。保留文字为空等同于尚未处理。
+    """
+    valid = _cut_signatures(fragments)
+    merged = dict(base)
+    for change in changes:
+        signature = change.get("signature", "")
+        if signature not in valid:
+            raise ValidationError("提交的校订不属于当前剪辑表")
+        status = change.get("status")
+        if status not in ("keep", "delete"):
+            raise ValidationError("请选择保留文字或标为删除")
+        text = _normalise_newlines(change.get("text") or "").strip("\n")
+        if status == "keep" and not text.strip():
+            merged.pop(signature, None)
+            continue
+        merged[signature] = {
+            "status": status,
+            "text": text if status == "keep" else "",
+        }
+    return merged
+
+
+def _write_decision_diff(
+    conn: sqlite3.Connection,
+    draft_id: int,
+    base: dict[str, dict],
+    merged: dict[str, dict],
+) -> None:
+    """只写入 base -> merged 之间有变化的校订。"""
+    now = _utc_now()
+    for signature in set(base) - set(merged):
+        conn.execute(
+            "DELETE FROM decision WHERE draft_id = ? AND signature = ?",
+            (draft_id, signature),
+        )
+    for signature, decision in merged.items():
+        if base.get(signature) == decision:
+            continue
+        conn.execute(
+            """
+            INSERT INTO decision (draft_id, signature, status, text, updated_at)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (draft_id, signature) DO UPDATE SET
+                status = excluded.status,
+                text = excluded.text,
+                updated_at = excluded.updated_at
+            """,
+            (draft_id, signature, decision["status"], decision.get("text", ""), now),
+        )
+
+
+def _rollback(conn: sqlite3.Connection) -> None:
+    try:
+        conn.execute("ROLLBACK")
+    except sqlite3.Error:
+        pass
+
+
 def save_decisions(
     conn: sqlite3.Connection,
     draft_id: int,
     expected_revision: int,
     changes: list[dict],
-) -> None:
+) -> dict[str, dict]:
     """保存校订；草稿页过期时拒绝。changes: [{signature, status, text}]。"""
     conn.execute("BEGIN IMMEDIATE")
     try:
@@ -631,43 +701,71 @@ def save_decisions(
         fragments = compute_occurrences(
             _parse_cuts(row["cuts_json"]), parse_vtt(row["vtt_raw"])
         )
-        valid = {occ.signature for occ in flatten(fragments) if occ.kind == CUT}
-        now = _utc_now()
-        for change in changes:
-            signature = change.get("signature", "")
-            if signature not in valid:
-                raise ValidationError("提交的校订不属于当前剪辑表")
-            status = change.get("status")
-            if status not in ("keep", "delete"):
-                raise ValidationError("请选择保留文字或标为删除")
-            text = _normalise_newlines(change.get("text") or "").strip("\n")
-            if status == "keep" and not text.strip():
-                # 空保留文字按尚未处理处理。
-                conn.execute(
-                    "DELETE FROM decision WHERE draft_id = ? AND signature = ?",
-                    (draft_id, signature),
-                )
-                continue
-            conn.execute(
-                """
-                INSERT INTO decision (draft_id, signature, status, text, updated_at)
-                VALUES (?, ?, ?, ?, ?)
-                ON CONFLICT (draft_id, signature) DO UPDATE SET
-                    status = excluded.status,
-                    text = excluded.text,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    draft_id,
-                    signature,
-                    status,
-                    text if status == "keep" else "",
-                    now,
-                ),
-            )
+        base = decision_rows(conn, draft_id)
+        merged = merge_decisions(fragments, base, changes)
+        _write_decision_diff(conn, draft_id, base, merged)
         conn.execute("COMMIT")
+        return merged
     except Exception:
-        conn.execute("ROLLBACK")
+        _rollback(conn)
+        raise
+
+
+def _publish_base(
+    conn: sqlite3.Connection,
+    draft_id: int,
+    expected_revision: int,
+) -> tuple[sqlite3.Row, list[Fragment], dict[str, dict]]:
+    """发布前读取一份基线：草稿行、出现与当前已保存的校订。
+
+    基线在一个只读事务里读全，读取时不占写锁，另一窗口仍可保存；
+    归档时会再次核对这份基线。
+    """
+    conn.execute("BEGIN")
+    try:
+        row = load_draft(conn, draft_id)
+        revision = lock_version(conn)
+        if row is None:
+            raise StaleDraft("校订页已过期：草稿不存在，请刷新后重新提交")
+        if (
+            row["revision"] != expected_revision
+            or revision != expected_revision
+            or row["published_version"] is not None
+        ):
+            raise StaleDraft("校订页已过期：剪辑表已更换或该页已发布，请刷新后重新提交")
+        fragments = compute_occurrences(
+            _parse_cuts(row["cuts_json"]), parse_vtt(row["vtt_raw"])
+        )
+        base = decision_rows(conn, draft_id)
+        conn.execute("COMMIT")
+        return row, fragments, base
+    except Exception:
+        _rollback(conn)
+        raise
+
+
+def _save_merged_if_unchanged(
+    conn: sqlite3.Connection,
+    draft_id: int,
+    expected_revision: int,
+    base: dict[str, dict],
+    changes: list[dict],
+) -> dict[str, dict]:
+    """仅在草稿与基线校订都未变时保存本次校订。"""
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        row = _reject_if_stale(conn, draft_id, expected_revision)
+        if decision_rows(conn, draft_id) != base:
+            raise StaleDraft("校订已在其他页面保存，请刷新后重新提交")
+        fragments = compute_occurrences(
+            _parse_cuts(row["cuts_json"]), parse_vtt(row["vtt_raw"])
+        )
+        merged = merge_decisions(fragments, base, changes)
+        _write_decision_diff(conn, draft_id, base, merged)
+        conn.execute("COMMIT")
+        return merged
+    except Exception:
+        _rollback(conn)
         raise
 
 
@@ -693,20 +791,24 @@ def get_edition(conn: sqlite3.Connection, version_no: int) -> Optional[sqlite3.R
     ).fetchone()
 
 
-def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> int:
-    """发布：所有剪口处理完毕才写入新版；任何失败都不留新版本。"""
+def _archive_edition(
+    conn: sqlite3.Connection,
+    draft_id: int,
+    expected_revision: int,
+    base: dict[str, dict],
+    merged: dict[str, dict],
+    fragments: list[Fragment],
+    vtt_text: str,
+) -> int:
+    """在写锁内核对基线并归档：草稿、校订或锁版本有变就要求刷新。"""
+    blob = vtt_text.encode("utf-8")
     conn.execute("BEGIN IMMEDIATE")
     try:
         row = _reject_if_stale(conn, draft_id, expected_revision)
-        fragments = compute_occurrences(
-            _parse_cuts(row["cuts_json"]), parse_vtt(row["vtt_raw"])
-        )
-        decisions = decision_rows(conn, draft_id)
-        pending = pending_occurrences(fragments, decisions)
-        if pending:
-            raise PublishBlocked(pending)
-        vtt_text = build_output(fragments, decisions)
-        blob = vtt_text.encode("utf-8")
+        if decision_rows(conn, draft_id) != base:
+            raise StaleDraft("校订已在其他页面保存，请刷新后重新提交")
+        # 本次表单校订与新版一同落库；任何写入失败会整体回滚。
+        _write_decision_diff(conn, draft_id, base, merged)
         latest = conn.execute(
             "SELECT COALESCE(MAX(version_no), 0) AS v FROM edition"
         ).fetchone()["v"]
@@ -739,5 +841,36 @@ def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> 
         conn.execute("COMMIT")
         return version_no
     except Exception:
-        conn.execute("ROLLBACK")
+        _rollback(conn)
         raise
+
+
+def publish_with_changes(
+    conn: sqlite3.Connection,
+    draft_id: int,
+    expected_revision: int,
+    changes: list[dict],
+) -> int:
+    """把本次校订合入生成前读到的草稿，生成 WebVTT 后原子归档。
+
+    - 生成阶段不占写锁，另一窗口仍可保存；
+    - 归档时若草稿已换、已发布，或已保存的校订与生成前不同，抛 StaleDraft；
+    - 表单不合法抛 ValidationError，尚未写入任何内容；
+    - 仍有剪口未处理时，草稿未变则先保留本次合法校订，再抛 PublishBlocked。
+    """
+    _row, fragments, base = _publish_base(conn, draft_id, expected_revision)
+    merged = merge_decisions(fragments, base, changes)
+    pending = pending_occurrences(fragments, merged)
+    if pending:
+        # 草稿未变时保留这次的合法校订；若期间已被别处改动则要求刷新。
+        _save_merged_if_unchanged(conn, draft_id, expected_revision, base, changes)
+        raise PublishBlocked(pending)
+    vtt_text = build_output(fragments, merged)
+    return _archive_edition(
+        conn, draft_id, expected_revision, base, merged, fragments, vtt_text
+    )
+
+
+def publish(conn: sqlite3.Connection, draft_id: int, expected_revision: int) -> int:
+    """发布已保存的校订：所有剪口处理完毕才写入新版；失败不留新版本。"""
+    return publish_with_changes(conn, draft_id, expected_revision, [])

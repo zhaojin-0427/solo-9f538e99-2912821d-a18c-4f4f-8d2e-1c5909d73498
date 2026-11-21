@@ -81,7 +81,7 @@
           标为删除
         </label>
         <textarea name="text:{{ item.index }}" rows="2"
-                  placeholder="录入保留的字幕文字（仅此一次出现）">{{ item.decision.text if item.decision and item.decision.status == 'keep' else '' }}</textarea>
+                  placeholder="录入保留的字幕文字（仅此一次出现）">{{ item.decision.text if item.decision else '' }}</textarea>
       </fieldset>
       {% endif %}
     </article>
